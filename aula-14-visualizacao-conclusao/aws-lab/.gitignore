@@ -25,4 +25,6 @@ __pycache__/
 *.py[cod]
 venv/
 .venv/
+# O dashboard HTML gerado pelo plano B é uma evidência/artefato da aula.
 dashboard.html
+!scripts/dashboard.html

@@ -17,6 +17,8 @@ provider "aws" {
 }
 
 locals {
+  is_windows = can(regex("^[A-Za-z]:", abspath(path.module)))
+
   csv_local = "${path.module}/../data/pedidos_mercadofacil_tratado.csv"
   csv_s3    = "s3://${var.bucket_nome}/silver/pedidos/"
 
@@ -25,6 +27,34 @@ locals {
   feriados_local = "${path.module}/../data/feriados.csv"
   feriados_s3    = "s3://${var.bucket_nome}/apoio/feriados/"
   superset       = var.criar_superset ? 1 : 0
+
+  upload_command_unix = <<-BASH
+    set -e
+    if ! aws s3api head-bucket --bucket "${var.bucket_nome}" >/dev/null 2>&1; then
+      aws s3api create-bucket --bucket "${var.bucket_nome}" --region "${var.regiao}"
+    fi
+    aws s3api put-public-access-block --bucket "${var.bucket_nome}" \
+      --public-access-block-configuration BlockPublicAcls=true,IgnorePublicAcls=true,BlockPublicPolicy=true,RestrictPublicBuckets=true
+    aws s3 cp "${local.csv_local}" "${local.csv_s3}pedidos_mercadofacil_tratado.csv"
+    aws s3 cp "${local.chuva_local}" "${local.chuva_s3}chuva_diaria.csv"
+    aws s3 cp "${local.feriados_local}" "${local.feriados_s3}feriados.csv"
+  BASH
+
+  upload_command_windows = <<-POWERSHELL
+    aws s3api head-bucket --bucket "${var.bucket_nome}" 2>$null
+    if ($LASTEXITCODE -ne 0) {
+      aws s3api create-bucket --bucket "${var.bucket_nome}" --region "${var.regiao}"
+      if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+    }
+    aws s3api put-public-access-block --bucket "${var.bucket_nome}" --public-access-block-configuration "BlockPublicAcls=true,IgnorePublicAcls=true,BlockPublicPolicy=true,RestrictPublicBuckets=true"
+    if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+    aws s3 cp "${local.csv_local}" "${local.csv_s3}pedidos_mercadofacil_tratado.csv"
+    if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+    aws s3 cp "${local.chuva_local}" "${local.chuva_s3}chuva_diaria.csv"
+    if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+    aws s3 cp "${local.feriados_local}" "${local.feriados_s3}feriados.csv"
+    if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+  POWERSHELL
 }
 
 # -----------------------------------------------------------------------------
@@ -39,20 +69,13 @@ resource "terraform_data" "bucket" {
   triggers_replace = [var.bucket_nome, var.regiao, filemd5(local.csv_local), filemd5(local.chuva_local), filemd5(local.feriados_local)]
 
   provisioner "local-exec" {
-    command = <<-CMD
-      set -e
-      aws s3api create-bucket --bucket "${var.bucket_nome}" --region "${var.regiao}" >/dev/null 2>&1 || true
-      aws s3api put-public-access-block --bucket "${var.bucket_nome}" \
-        --public-access-block-configuration BlockPublicAcls=true,IgnorePublicAcls=true,BlockPublicPolicy=true,RestrictPublicBuckets=true
-      aws s3 cp "${local.csv_local}" "${local.csv_s3}pedidos_mercadofacil_tratado.csv"
-      aws s3 cp "${local.chuva_local}" "${local.chuva_s3}chuva_diaria.csv"
-      aws s3 cp "${local.feriados_local}" "${local.feriados_s3}feriados.csv"
-    CMD
+    interpreter = local.is_windows ? ["PowerShell", "-NoProfile", "-NonInteractive", "-Command"] : ["/bin/bash", "-c"]
+    command     = local.is_windows ? local.upload_command_windows : local.upload_command_unix
   }
 
   provisioner "local-exec" {
     when    = destroy
-    command = "aws s3 rb s3://${self.input.bucket} --force || true"
+    command = "aws s3 rb s3://${self.input.bucket} --force"
   }
 }
 
