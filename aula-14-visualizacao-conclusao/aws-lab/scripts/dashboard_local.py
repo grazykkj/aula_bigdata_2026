@@ -31,19 +31,21 @@ def carregar_chuva():
         return {(r["cidade"], r["dia"]): float(r["chuva_3d_mm"]) for r in csv.DictReader(f)}
 
 
-def agregar(linhas):
+def agregar(linhas, incluir_regioes=True):
     chuva = carregar_chuva()
     entregues = [r for r in linhas if r["status_pedido"] == "entregue"]
 
-    por_mes = defaultdict(float)
+    por_dia = defaultdict(float)
     por_cat = defaultdict(float)
     for r in entregues:
-        por_mes[r["data_pedido"][:7]] += float(r["valor_total"])
+        por_dia[r["data_pedido"]] += float(r["valor_total"])
         por_cat[r["categoria"]] += float(r["valor_total"])
 
     atraso_regiao = defaultdict(list)
+    atraso_estado = defaultdict(list)
     for r in entregues:
         atraso_regiao[r["regiao"]].append(float(r["atraso_dias"]))
+        atraso_estado[r["estado"]].append(float(r["atraso_dias"]))
 
     faixas = {"0 (no prazo)": [], "1-3": [], "4-7": [], "8+": []}
     for r in entregues:
@@ -55,7 +57,7 @@ def agregar(linhas):
 
     problemas = defaultdict(lambda: [0, 0, 0])  # itens, cancelado, devolvido
     for r in linhas:
-        p = problemas[r["categoria"]]
+        p = problemas[(r["categoria"], r["canal"])]
         p[0] += 1
         p[1] += r["status_pedido"] == "cancelado"
         p[2] += r["status_pedido"] == "devolvido"
@@ -69,37 +71,44 @@ def agregar(linhas):
     def media(v):
         return round(sum(v) / len(v), 2) if v else 0
 
-    meses = sorted(por_mes)
+    dias = sorted(por_dia)
     cats = sorted(por_cat, key=por_cat.get, reverse=True)
-    regs = sorted(atraso_regiao)
-    return {
+    estados = sorted(atraso_estado)
+    chaves_problema = sorted(problemas, key=lambda k: (k[0], k[1]))
+    dados = {
         "kpis": {
-            "receita": round(sum(por_mes.values()), 2),
+            "receita": round(sum(por_dia.values()), 2),
             "pedidos": len({r["pedido_id"] for r in entregues}),
             "atrasados": round(100 * sum(float(r["atraso_dias"]) > 0 for r in entregues) / len(entregues), 1),
             "nota": media([int(r["nota_avaliacao"]) for r in entregues if r["nota_avaliacao"] != ""]),
         },
-        "mes": {"x": meses, "y": [round(por_mes[m], 2) for m in meses]},
+        "dia": {"x": dias, "y": [round(por_dia[d], 2) for d in dias]},
         "cat": {"x": cats, "y": [round(por_cat[c], 2) for c in cats]},
-        "regiao": {"x": regs, "y": [media(atraso_regiao[g]) for g in regs]},
+        "estado": {"x": estados, "y": [media(atraso_estado[e]) for e in estados]},
         "nota": {"x": list(faixas), "y": [media(v) for v in faixas.values()]},
         "chuva": {"x": list(faixas_chuva), "y": [media(v) for v in faixas_chuva.values()]},
         "problemas": {
-            "x": cats,
-            "cancel": [round(100 * problemas[c][1] / problemas[c][0], 2) for c in cats],
-            "devol": [round(100 * problemas[c][2] / problemas[c][0], 2) for c in cats],
+            "x": [f"{c} / {canal}" for c, canal in chaves_problema],
+            "cancel": [round(100 * problemas[k][1] / problemas[k][0], 2) for k in chaves_problema],
+            "devol": [round(100 * problemas[k][2] / problemas[k][0], 2) for k in chaves_problema],
         },
     }
+    if incluir_regioes:
+        regioes = sorted({r["regiao"] for r in linhas})
+        dados["por_regiao"] = {regiao: agregar([r for r in linhas if r["regiao"] == regiao], False) for regiao in regioes}
+        dados["regioes"] = regioes
+    return dados
 
 
 HTML = """<!doctype html><html lang="pt-br"><meta charset="utf-8">
 <title>MercadoFacil - Dashboard (Plano B)</title>
 <script src="https://cdn.jsdelivr.net/npm/chart.js@4"></script>
 <style>body{font-family:sans-serif;margin:24px;background:#f5f6f8}
-.kpis{display:flex;gap:16px;margin-bottom:16px}.kpi{background:#fff;padding:16px 24px;border-radius:8px}
+.kpis{display:flex;gap:16px;margin-bottom:16px;flex-wrap:wrap}.kpi{background:#fff;padding:16px 24px;border-radius:8px}
 .kpi b{display:block;font-size:26px}.grid{display:grid;grid-template-columns:1fr 1fr;gap:16px}
-.card{background:#fff;padding:12px;border-radius:8px}</style>
+.card{background:#fff;padding:12px;border-radius:8px}label{display:inline-block;margin:12px 0}</style>
 <h1>MercadoFacil 2025 - visao executiva</h1>
+<label>Filtrar região: <select id="filtro-regiao"><option value="Todas">Todas as regiões</option></select></label>
 <div class="kpis" id="kpis"></div>
 <div class="grid">
 <div class="card"><canvas id="c1"></canvas></div><div class="card"><canvas id="c2"></canvas></div>
@@ -107,22 +116,30 @@ HTML = """<!doctype html><html lang="pt-br"><meta charset="utf-8">
 <div class="card"><canvas id="c5"></canvas></div><div class="card"><canvas id="c6"></canvas></div></div>
 <script>
 const D = __DADOS__;
-const k = D.kpis, fmt = new Intl.NumberFormat('pt-BR');
+const fmt = new Intl.NumberFormat('pt-BR');
+const charts = {};
+const seletor = document.getElementById('filtro-regiao');
+D.regioes.forEach(r => seletor.add(new Option(r, r)));
+function render(d){
+const k=d.kpis;
 document.getElementById('kpis').innerHTML =
  `<div class=kpi>Receita (entregues)<b>R$ ${fmt.format(k.receita)}</b></div>`+
  `<div class=kpi>Pedidos<b>${fmt.format(k.pedidos)}</b></div>`+
  `<div class=kpi>Itens atrasados<b>${k.atrasados}%</b></div>`+
  `<div class=kpi>Nota media<b>${k.nota}</b></div>`;
-function g(id,type,titulo,x,datasets){new Chart(document.getElementById(id),{type,
- data:{labels:x,datasets},options:{plugins:{title:{display:true,text:titulo}}}})}
-g('c1','line','Receita por mes (R$)',D.mes.x,[{label:'receita',data:D.mes.y,borderColor:'#1f77b4'}]);
-g('c2','bar','Receita por categoria (R$)',D.cat.x,[{label:'receita',data:D.cat.y,backgroundColor:'#2ca02c'}]);
-g('c3','bar','Atraso medio (dias) por regiao',D.regiao.x,[{label:'dias',data:D.regiao.y,backgroundColor:'#d62728'}]);
-g('c4','bar','Nota media por faixa de atraso (dias)',D.nota.x,[{label:'nota',data:D.nota.y,backgroundColor:'#ff7f0e'}]);
-g('c5','bar','% cancelado e devolvido por categoria',D.problemas.x,[
- {label:'% cancelado',data:D.problemas.cancel,backgroundColor:'#9467bd'},
- {label:'% devolvido',data:D.problemas.devol,backgroundColor:'#8c564b'}]);
-g('c6','bar','Atraso medio (dias) por chuva nos 3 dias (mm)',D.chuva.x,[{label:'dias',data:D.chuva.y,backgroundColor:'#17becf'}]);
+function g(id,type,titulo,x,datasets,stacked=false){if(charts[id])charts[id].destroy();charts[id]=new Chart(document.getElementById(id),{type,
+ data:{labels:x,datasets},options:{responsive:true,plugins:{title:{display:true,text:titulo}},scales:{x:{stacked,title:{display:true,text:'Categoria / período'}},y:{stacked,title:{display:true,text:'Valor da métrica'}}}}})}
+g('c1','line','Receita diária (R$) — destaque para Black Friday e Natal',d.dia.x,[{label:'receita',data:d.dia.y,borderColor:'#1f77b4',pointRadius:0}]);
+g('c2','bar','Nota média por faixa de atraso (dias)',d.nota.x,[{label:'nota (1 a 5)',data:d.nota.y,backgroundColor:'#ff7f0e'}]);
+g('c3','bar','Atraso médio por estado (dias)',d.estado.x,[{label:'dias',data:d.estado.y,backgroundColor:'#d62728'}]);
+g('c4','bar','Receita por categoria (R$)',d.cat.x,[{label:'receita',data:d.cat.y,backgroundColor:'#2ca02c'}]);
+g('c5','bar','Cancelamento e devolução por categoria / canal (%)',d.problemas.x,[
+ {label:'% cancelado',data:d.problemas.cancel,backgroundColor:'#9467bd'},
+ {label:'% devolvido',data:d.problemas.devol,backgroundColor:'#8c564b'}],true);
+g('c6','bar','Atraso médio por faixa de chuva acumulada em 3 dias',d.chuva.x,[{label:'dias',data:d.chuva.y,backgroundColor:'#17becf'}]);
+}
+render(D);
+seletor.addEventListener('change',()=>render(seletor.value==='Todas'?D:D.por_regiao[seletor.value]));
 </script></html>"""
 
 
